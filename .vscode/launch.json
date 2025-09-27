@@ -5,12 +5,12 @@
       "name": "Generate Bring-Up Plan",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/generator/generate_plan.py",
+      "program": "${workspaceFolder}/lora-bringup-gen/generator/generate_plan.py",
       "console": "integratedTerminal",
       "args": [
-        "--requirements", "inputs/requirements.yaml",
-        "--out-md", "outputs/LoRa_Car_Radio_BringUp.md",
-        "--out-csv", "outputs/BringUp_Datasheet.csv"
+        "--requirements", "${workspaceFolder}/lora-bringup-gen/inputs/requirements.yaml",
+        "--out-md", "${workspaceFolder}/lora-bringup-gen/outputs/LoRa_Car_Radio_BringUp.md",
+        "--out-csv", "${workspaceFolder}/lora-bringup-gen/outputs/BringUp_Datasheet.csv"
       ]
     }
   ]
