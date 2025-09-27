@@ -16,11 +16,11 @@ import streamlit as st
 st.set_page_config(page_title="Plan Generator", layout="centered")
 st.title("Plan Generator")
 
-# 1) API key (masked). Stored only in memory for this session.
-api_key = st.text_input("OpenAI API Key", type="password", help="Required to generate the document.")
+# 1) OpenAI API key (masked)
+api_key = st.text_input("OpenAI API Key", type="password")
 
-# 2) Single file upload (.ipc)
-ipc_file = st.file_uploader("Upload .ipc file", type=["ipc"])
+# 2) Single file upload (ANY file type)
+uploaded = st.file_uploader("Upload file")  # no 'type=' => accepts any file
 
 # 3) Generate button
 run = st.button("Generate", type="primary", use_container_width=True)
@@ -33,12 +33,12 @@ def run_cmd(cmd, extra_env=None):
     return proc.returncode, proc.stdout, proc.stderr
 
 if run:
-    # Basic validations (keep UI minimal but helpful)
+    # Minimal validation
     if not api_key:
         st.error("Please enter your OpenAI API key.")
         st.stop()
-    if not ipc_file:
-        st.error("Please upload a .ipc file first.")
+    if not uploaded:
+        st.error("Please upload a file first.")
         st.stop()
 
     project_root = Path(__file__).resolve().parent
@@ -49,11 +49,11 @@ if run:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_docx = artifacts / f"plan_{ts}.docx"
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="ipc_"))
+    # Save the uploaded file to a temp path and pass that path as --ipc
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ipc_input_"))
     try:
-        # Save uploaded IPC into a temp file
-        ipc_path = tmp_dir / ipc_file.name
-        ipc_path.write_bytes(ipc_file.getbuffer())
+        input_path = tmp_dir / uploaded.name
+        input_path.write_bytes(uploaded.getbuffer())
 
         if not script.exists():
             st.error(f"Script not found: {script}")
@@ -62,23 +62,21 @@ if run:
         with st.spinner("Generating..."):
             cmd = [
                 sys.executable, str(script),
-                "--ipc", str(ipc_path),
-                "--out-docx", str(out_docx),
-                # If your script also supports optional outputs/flags, add them here:
+                "--ipc", str(input_path),          # script requires --ipc (path can be any file)
+                "--out-docx", str(out_docx),       # required output
+                # Optional flags (uncomment if your script uses them):
                 # "--out-md", str(artifacts / f"plan_{ts}.md"),
-                # "--board-hint", "XYZ",
-                # "--meta", "some.json",
+                # "--board-hint", "YOUR_HINT",
+                # "--meta", str(project_root / "meta.json"),
             ]
-            # Pass the API key to the subprocess as an env var
             code, stdout, stderr = run_cmd(cmd, extra_env={"OPENAI_API_KEY": api_key})
 
-        # Logs (kept visible for quick debugging)
-        st.subheader("Execution log")
-        st.code(stdout or "(no stdout)", language="bash")
-
+        # Logs (kept minimal: only show on demand)
+        with st.expander("Execution log", expanded=False):
+            st.code(stdout or "(no stdout)", language="bash")
         if code != 0:
-            st.subheader("Error output")
-            st.code(stderr or "(no stderr)", language="bash")
+            with st.expander("Error output", expanded=True):
+                st.code(stderr or "(no stderr)", language="bash")
             st.error("Generation failed.")
             st.stop()
 
