@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Generate Bring-Up Plan",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/generator/generate_plan.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--requirements", "inputs/requirements.yaml",
+        "--out-md", "outputs/LoRa_Car_Radio_BringUp.md",
+        "--out-csv", "outputs/BringUp_Datasheet.csv"
+      ]
+    }
+  ]
+}
