@@ -11,6 +11,34 @@ from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
+import time
+from pathlib import Path
+
+def safe_docx_save(doc, desired_path: str, attempts: int = 3) -> str:
+    """
+    Try to save to desired_path. If it's locked (PermissionError),
+    fall back to a timestamped filename in the same folder.
+    Returns the actual path written.
+    """
+    p = Path(desired_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    for i in range(attempts):
+        try:
+            doc.save(str(p))
+            return str(p)
+        except PermissionError:
+            # OneDrive/Word lock; wait and retry briefly
+            time.sleep(0.5)
+
+    # Still locked: write to a unique fallback next to it
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fallback = p.with_name(f"{p.stem}__{ts}.docx")
+    doc.save(str(fallback))
+    sys.stderr.write(
+        f"⚠️ Could not overwrite '{p.name}' (locked). Wrote fallback: {fallback}\n"
+    )
+    return str(fallback)
 
 def _add_heading(doc: Document, text: str, level: int = 1):
     h = doc.add_heading(text, level=level)
@@ -72,37 +100,39 @@ def _add_rails_table(doc: Document, rows: List[dict]):
         cells[5].text = ""  # left blank for operator to fill
     # A bit of spacing after
     doc.add_paragraph()
-def write_docx(procedure_text: str, nets: Dict[str, List[str]], out_docx: str, board_hint: str | None):
+def write_docx(procedure_text: str, nets: Dict[str, List[str]], out_docx: str, board_hint: str | None, meta: dict | None = None):
     doc = Document()
 
     # Title
-    title = "Factory Bring-Up Procedure"
+    title = "Test Plan"
     if board_hint:
         title += f" – {board_hint}"
     _add_heading(doc, title, level=1)
     _add_para(doc, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     doc.add_paragraph()
 
-    # Split the LLM output roughly into sections by blank lines and write
-    # We also detect likely section titles like "4.2. Voltage Rail Checks"
+    # Split into blocks and render
     blocks = re.split(r"\n\s*\n", procedure_text.strip())
     for block in blocks:
-        lines = [ln.rstrip() for ln in block.splitlines()]
+        lines = [ln.rstrip() for ln in block.splitlines() if ln.strip() != "" or ln == ""]
         if not lines:
             continue
         head = lines[0].strip()
 
-        # If looks like a section header (e.g., "4.2. Voltage Rail Checks")
+        # Section header like "4.2. Voltage Rail Checks" OR Markdown "# ..."
         if re.match(r"^\d+(\.\d+)*\.\s", head) or re.match(r"^\d+\.\s[A-Z]", head):
             _add_heading(doc, head, level=2)
             body = lines[1:]
+        elif _MD_H.match(head):
+            _add_md_heading_or_para(doc, head)
+            body = lines[1:]
         else:
-            # Non-numbered heading lines like "Figure 4 1 Test Configuration A"
+            # Figure captions (make bold + try to insert image)
             if re.match(r"^Figure\s+\d", head, re.IGNORECASE):
                 _add_para(doc, head, bold=True)
+                _insert_figure_if_any(doc, head, meta)
                 body = lines[1:]
             else:
-                # plain body
                 body = lines
 
         _add_numbered_or_bullets(doc, body)
@@ -113,8 +143,10 @@ def write_docx(procedure_text: str, nets: Dict[str, List[str]], out_docx: str, b
             _add_rails_table(doc, rows)
 
     # Save
-    os.makedirs(os.path.dirname(os.path.abspath(out_docx)), exist_ok=True)
-    doc.save(out_docx)
+    # Save (robust)
+    actual_path = safe_docx_save(doc, out_docx)
+    return actual_path  # optionally return the path we actually wrote
+
 
 # Map rails to expected values/tolerance for the table
 _POWER_SPEC = {
@@ -346,26 +378,155 @@ def build_context(nets: Dict[str, List[str]]) -> str:
     ]
     return "\n".join(ctx_parts)
 
+# --- Markdown-ish inline bold renderer ---
+_BOLD_TOKEN = re.compile(r'(\*\*[^*]+\*\*)')
+
+def _add_md_runs(p, text: str):
+    """Write text into a python-docx paragraph with **bold** support."""
+    # Split by **...** and alternate
+    parts = _BOLD_TOKEN.split(text)
+    for part in parts:
+        if part.startswith("**") and part.endswith("**") and len(part) > 4:
+            run = p.add_run(part[2:-2])
+            run.bold = True
+        else:
+            p.add_run(part)
+
+# --- Minimal Markdown heading detector: "#", "##", "###"
+_MD_H = re.compile(r'^\s*(#{1,6})\s+(.*)$')
+
+def _add_md_heading_or_para(doc: Document, line: str):
+    """
+    Turn '# Title' -> heading, otherwise paragraph that understands **bold**.
+    """
+    m = _MD_H.match(line)
+    if m:
+        level = min(len(m.group(1)), 3)  # map #=1, ##=2, ###+=3
+        doc.add_heading(m.group(2).strip(), level=level)
+    else:
+        p = doc.add_paragraph()
+        _add_md_runs(p, line)
+
+def _insert_figure_if_any(doc: Document, caption_line: str, meta: dict | None):
+    """
+    If the line looks like 'Figure 4-1 ...' or 'Figure 4–1 ...',
+    try to insert an image below it. Priority:
+    - meta['figures'] dict: keys '4-1' or 'Figure 4-1' -> path
+    - default filenames in cwd: 'Figure_4-1.png', 'Figure_4-1.jpg'
+    """
+    if meta is None:
+        meta = {}
+    m = re.match(r'^\s*Figure\s+(\d+[-–]\d+)\b', caption_line, re.IGNORECASE)
+    if not m:
+        return
+    key = m.group(1).replace("–", "-")
+    width_in = float(meta.get("figure_width_in", 5.5))
+
+    # 1) metadata map
+    candidate = None
+    figs = meta.get("figures") if isinstance(meta.get("figures"), dict) else {}
+    if figs:
+        candidate = figs.get(key) or figs.get(f"Figure {key}")
+
+    # 2) default filenames if not supplied in meta
+    if not candidate:
+        for ext in (".png", ".jpg", ".jpeg"):
+            cand = f"Figure_{key}{ext}"
+            if os.path.exists(cand):
+                candidate = cand
+                break
+
+    # 3) insert if it exists
+    if candidate and os.path.exists(candidate):
+        try:
+            from docx.shared import Inches
+            doc.add_picture(candidate, width=Inches(width_in))
+        except Exception:
+            pass  # don't crash on image issues
 
 # -------------------------------
 # 3) LLM call (OpenAI) to write the plan
 # -------------------------------
 PROMPT_TMPL = """You are an electronics bring-up expert.
-Write a clear, beginner-friendly FACTORY BRING-UP PROCEDURE using ONLY the validated IPC netlist context below.
-Do NOT invent components that are not implied by net names. If some nets are missing, write generic but safe steps.
 
-Strict format:
-- Section numbering like 4., 4.1., 4.2. ...
-- Numbered steps (1., 2., 3., ...). Use lettered sub-steps (a., b., c., ...) where helpful.
-- Include a "Voltage Rail Checks" section with shorts checks that reference specific pins/nets found in the context (e.g., J3-1, J3-2 (GND), U6-14..16 (+5V), P2-2 (+3V3), U12-1 (+3V3_RF)).
-- Include "Firmware Programming" and "Functional Test" sections. If serial/JTAG details aren't in the context, write safe generic steps.
-- Do NOT include a Markdown table for rails; the app will build a Word table itself.
+Write a clear, beginner-friendly Test Plan Procedure that matches the customer house style shown below.
+Use ONLY the validated IPC netlist context and provided metadata. If some details are missing, write safe,
+generic steps and clearly label them as generic. Do NOT invent parts that are not implied by net names.
 
-Context:
+STYLE / FORMAT REQUIREMENTS (STRICT):
+- Use section numbering exactly like: 1., 2., 3., 4., 5., 6.
+- Use numbered steps (1., 2., 3., …) with lettered sub-steps (a., b., c., …) when listing items to probe.
+- Reference the exact pins/nets detected from context: {J3_1}, {J3_2}, {U6_14_16}, {P2_2}, {U12_1}.
+- Refer to figures verbatim as “Figure 4-1 Test Configuration A” and “Figure 4-2 Test Configuration B”.
+- Do NOT include Markdown tables for the rail checks; write rows as bullet/numbered lines so downstream can build Word tables.
+- Keep wording terse and technical; mirror the tone of engineering procedures.
+- Include warnings exactly as parenthetical “(WARNING: …)”.
+
+CONTENT REQUIREMENTS:
+1. Test Equipment
+- Emit an equipment list “Item, Manufacturer, Part Number, Description” using metadata.equipment if present.
+  If metadata is missing, emit a generic list (power supply, DMM, oscilloscope, JTAG programmer, USB-TTL cable, test PC).
+
+2. Procedure
+
+2.1. Visual Inspection
+1. Instruct to inspect per IPC-610 and drawing numbers from metadata.visual if present; otherwise generic IPC-610 Class 2.
+
+2.2. Voltage Rail Checks
+(Reference “Figure 4-1 Test Configuration A” when describing cabling.)
+1. Set multimeter to diode/beep mode.
+2. With black probe on {GND_PAD}, verify the following locations ARE connected to ground:
+   a. P2 pin 1 (GPIO Header)   [generic if not found]
+3. With black probe still on {GND_PAD}, verify the following are NOT connected to ground:
+   a. {PWR_JACK}
+   b. {PLUS5}
+   c. {PLUS3}
+   d. {PLUS3RF}
+4. With black probe on {PLUS5}, verify NOT connected:
+   a. {PLUS3}
+   b. {PLUS3RF}
+5. With black probe on {PLUS3}, verify NOT connected:
+   a. {PLUS3RF}
+6. Instruct safe power-up using metadata.power (default 5.0 V, 200 mA), warnings on over-current.
+7. Connect supply to barrel jack via Item 3 (power cable). Reference Figure 4-1.
+8. (WARNING: If UUT draws too much current, be prepared to turn off the power supply quickly.)
+9. (WARNING) If current exceeds limit (constant-current mode), disable supply and stop procedure.
+10. With black probe on {GND_PAD}, measure and record:
+    a. {PWR_JACK}: 5V ±100mV (or metadata tolerance if provided)
+    b. {PLUS5}:    5V ±100mV
+    c. {PLUS3}:    3.3V ±100mV
+    d. {PLUS3RF}:  3.3V ±100mV
+11. Oscilloscope setup (Item 7): CH1 1V/div, 5us/div, measurement=frequency.
+12. Probe Y1 pin 1 and verify ~16 MHz (use metadata.oscillators if provided).
+13. Probe Y2 pin 1 and verify ~32 MHz (use metadata.oscillators if provided).
+14. Power off UUT.
+
+2.3. Firmware Programming
+(Reference “Figure 4-2 Test Configuration B”.)
+1. Connect JTAG Programmer (Item 4) to test PC (Item 5) via USB; connect to UUT JTAG.
+2. Connect USB-TTL cable (Item 6) to test PC and UUT debug header (P2) with pinout:
+   - P2 pin 1 → GND (black)
+   - P2 pin 8 → Rx (white)
+   - P2 pin 10 → Tx (green)
+3. Program the UUT per metadata.programming.procedure_doc if present; otherwise write “per programming procedure”. Verify success.
+
+2.4. Functional Test
+1. Open a serial terminal with parameters (use metadata.serial, else 115200/8N1).
+2. Reset the UUT by pressing SW1.
+3. Verify welcome screen prints.
+4. Run commands: “bit.lora”, “bit.gps”, “bit.imu”, “bit.i2c”; verify each shows Pass.
+
+CONTEXT (IPC nets):
 ---------
 {context}
 ---------
+
+METADATA (optional):
+---------
+{metadata}
+---------
 """
+
 def call_openai_procedure(context: str) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -387,41 +548,85 @@ def call_openai_procedure(context: str) -> str:
     )
     return completion.choices[0].message.content
 
-def call_openai_markdown(context: str) -> str:
-    """
-    Calls OpenAI to produce the step-by-step plan (Markdown).
-    Requires OPENAI_API_KEY in env. Uses gpt-4o-mini by default.
-    """
+def call_openai_markdown(context: str, nets: Dict[str, List[str]], meta: dict) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set. Cannot generate document via OpenAI.")
-
-    # Lightweight, direct client (no heavy LangChain needed for this use).
-    try:
-        from openai import OpenAI  # pip install openai>=1.0
-    except Exception as e:
-        raise RuntimeError("OpenAI client not installed. pip install openai") from e
-
+    from openai import OpenAI
     client = OpenAI(api_key=api_key)
 
-    prompt = PROMPT_TMPL.format(context=context)
+    prompt = build_prompt(context, nets, meta)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Use Responses API (new SDK). If your env only has older SDK, adjust accordingly.
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.2,
+        temperature=0.1,
         messages=[
             {"role": "system", "content": "You are a precise, safe hardware bring-up planner."},
             {"role": "user", "content": prompt},
         ],
     )
     md = completion.choices[0].message.content
-    # Prepend a title if model didn't add one
-    if not md.strip().lower().startswith("#"):
-        md = f"# Auto Bring-Up Plan (from IPC)\nGenerated: {ts}\n\n" + md
+    if not md.strip().lower().startswith("3.2"):
+        md = f"3.2. Test Equipment\n\n" + md  # ensure numbering starts per spec
     return md
+def build_prompt(context: str, nets: Dict[str, List[str]], meta: dict) -> str:
+    a = pick_anchors(nets)
+    return PROMPT_TMPL.format(
+        context=context,
+        metadata=json.dumps(meta or {}, indent=2),
+        J3_1=(a["J3_1_PWR_JACK"][0] if a["J3_1_PWR_JACK"] else "J3 pin 1"),
+        J3_2=(a["J3_2_GND"][0] if a["J3_2_GND"] else "J3 pin 2"),
+        U6_14_16=", ".join(a["U6_14_16_5V"]) if a["U6_14_16_5V"] else "U6 pins (5V)",
+        P2_2=(a["P2_2_3V3"][0] if a["P2_2_3V3"] else "P2 pin 2"),
+        U12_1=(a["U12_1_3V3RF"][0] if a["U12_1_3V3RF"] else "U12 pin 1"),
+        GND_PAD=a["human"]["gnd_pad"],
+        PWR_JACK=a["human"]["pwrjack"],
+        PLUS5=a["human"]["p5v"],
+        PLUS3=a["human"]["p3v3"],
+        PLUS3RF=a["human"]["p3v3rf"],
+    )
+def pick_anchors(nets: Dict[str, List[str]]) -> dict:
+    """Pick canonical probe points matching your doc style."""
+    def by_net(name):
+        return [r for r in nets.get(name, []) if re.match(r"^[A-Z]+[A-Z0-9]*-\w+$", r)]
 
+    # try to find typical refs
+    gnd_refs = by_net("327GND") or by_net("GND") or []
+    pwrjack_refs = by_net("327PWR_JACK") or by_net("PWR_JACK") or []
+    plus5_refs = by_net("327+5V") or by_net("+5V") or []
+    plus3_refs = by_net("327+3V3") or by_net("+3V3") or []
+    plus3rf_refs = by_net("327+3V3_RF") or by_net("+3V3_RF") or []
+
+    # choose specific pins to mirror your sample
+    def pick(refs, want_prefix, want_pins=None):
+        # want_prefix like "J3", "U6", "P2", "U12"
+        cands = [r for r in refs if r.startswith(want_prefix + "-")]
+        if want_pins:
+            cands = [f"{want_prefix}-{p}" for p in want_pins if f"{want_prefix}-{p}" in cands]
+        return cands
+
+    anchors = {
+        "J3_1_PWR_JACK": pick(pwrjack_refs, "J3", ["1"]) or pick(pwrjack_refs, "J3"),
+        "J3_2_GND":      pick(gnd_refs, "J3", ["2"]) or pick(gnd_refs, "J3"),
+        "U6_14_16_5V":   pick(plus5_refs, "U6", ["14","15","16"]) or [r for r in plus5_refs if r.startswith("U6-")],
+        "P2_2_3V3":      pick(plus3_refs, "P2", ["2"]) or pick(plus3_refs, "P2"),
+        "U12_1_3V3RF":   pick(plus3rf_refs, "U12", ["1"]) or pick(plus3rf_refs, "U12"),
+    }
+    # flatten ranges into compact text like "U6 pins 14–16"
+    def fmt_range(lst, label):
+        pins = [x.split("-")[1] for x in lst if "-" in x]
+        if pins == ["14","15","16"]: return f"U6 pins 14–16 {label}"
+        if len(pins) == 1: return f"{lst[0]} {label}"
+        return f"{', '.join(lst)} {label}"
+    anchors["human"] = {
+        "gnd_pad": "ground pad (pin 2) of the input barrel jack (J3) (GND)" if anchors["J3_2_GND"] else "a known GND pad",
+        "pwrjack": f"{anchors['J3_1_PWR_JACK'][0]} (PWR_JACK)" if anchors["J3_1_PWR_JACK"] else "J3 pin 1 (PWR_JACK)",
+        "p5v":     fmt_range(anchors["U6_14_16_5V"], "(+5V)") if anchors["U6_14_16_5V"] else "+5V rail pins",
+        "p3v3":    f"{anchors['P2_2_3V3'][0]} (+3V3)" if anchors["P2_2_3V3"] else "+3V3 rail pins",
+        "p3v3rf":  f"{anchors['U12_1_3V3RF'][0]} (+3V3_RF)" if anchors["U12_1_3V3RF"] else "+3V3_RF rail pins",
+    }
+    return anchors
 
 # -------------------------------
 # 4) Main
@@ -453,22 +658,82 @@ def main():
     if args.board_hint:
         ctx = f"[Board hint: {args.board_hint}]\n\n" + ctx
 
-    # (Optional) metadata load – not used directly in this minimal Word writer yet
+    # 3b) Load optional metadata
     meta = load_meta(args.meta) if args.meta else {}
 
     # 4) Get step-by-step procedure text from LLM
     try:
-        proc_txt = call_openai_procedure(ctx)
+        # Prefer the new signature (ctx, nets, meta)
+        try:
+            proc_txt = call_openai_procedure(ctx, nets, meta)  # new signature
+        except TypeError:
+            # === Legacy fallback path ===
+            # Patch PROMPT_TMPL so it contains only {context} before legacy function formats it.
+            # Build anchors safely from parsed nets.
+            def _take(refs, prefix, pins=None):
+                lst = [r for r in refs if r.startswith(prefix + "-")]
+                if pins:
+                    lst = [f"{prefix}-{p}" for p in pins if f"{prefix}-{p}" in lst]
+                return lst
+
+            # NEW: escape braces helper for JSON insertion
+            def _esc_braces(s: str) -> str:
+                return s.replace("{", "{{").replace("}", "}}")
+
+            gnd_refs    = nets.get("327GND", []) or nets.get("GND", [])
+            pwrjack_refs= nets.get("327PWR_JACK", []) or nets.get("PWR_JACK", [])
+            plus5_refs  = nets.get("327+5V", []) or nets.get("+5V", [])
+            plus33_refs = nets.get("327+3V3", []) or nets.get("+3V3", [])
+            plus33rf_refs = nets.get("327+3V3_RF", []) or nets.get("+3V3_RF", [])
+
+            J3_1 = (_take(pwrjack_refs, "J3", ["1"]) or _take(pwrjack_refs, "J3") or ["J3-1"])[0]
+            J3_2 = (_take(gnd_refs, "J3", ["2"]) or _take(gnd_refs, "J3") or ["J3-2"])[0]
+            U6_14_16_list = _take(plus5_refs, "U6", ["14","15","16"]) or [r for r in plus5_refs if r.startswith("U6-")] or ["U6-14"]
+            U6_14_16 = ", ".join(U6_14_16_list)
+            P2_2 = (_take(plus33_refs, "P2", ["2"]) or _take(plus33_refs, "P2") or ["P2-2"])[0]
+            U12_1 = (_take(plus33rf_refs, "U12", ["1"]) or _take(plus33rf_refs, "U12") or ["U12-1"])[0]
+
+            GND_PAD = "ground pad (pin 2) of the input barrel jack (J3) (GND)" if J3_2.startswith("J3-2") else "a known GND pad"
+            PWR_JACK = f"{J3_1} (PWR_JACK)"
+            PLUS5 = f"{U6_14_16} (+5V)"
+            PLUS3 = f"{P2_2} (+3V3)"
+            PLUS3RF = f"{U12_1} (+3V3_RF)"
+
+            global PROMPT_TMPL
+            prepared = (PROMPT_TMPL
+                        .replace("{J3_1}", J3_1)
+                        .replace("{J3_2}", J3_2)
+                        .replace("{U6_14_16}", U6_14_16)
+                        .replace("{P2_2}", P2_2)
+                        .replace("{U12_1}", U12_1)
+                        .replace("{GND_PAD}", GND_PAD)
+                        .replace("{PWR_JACK}", PWR_JACK)
+                        .replace("{PLUS5}", PLUS5)
+                        .replace("{PLUS3}", PLUS3)
+                        .replace("{PLUS3RF}", PLUS3RF)
+                        # IMPORTANT: escape braces in JSON so .format(context=...) won't choke
+                        .replace("{metadata}", _esc_braces(json.dumps(meta or {}, indent=2)))
+                       )
+            PROMPT_TMPL = prepared
+
+            proc_txt = call_openai_procedure(ctx)  # legacy signature
     except Exception as e:
         sys.stderr.write(f"LLM ERROR: {e}\n")
         sys.exit(3)
 
-    # 5) Write DOCX
-    write_docx(proc_txt, nets, args.out_docx, args.board_hint)
+    # 5) Ensure output directories exist and write DOCX
+    out_docx_dir = os.path.dirname(os.path.abspath(args.out_docx))
+    if out_docx_dir:
+        os.makedirs(out_docx_dir, exist_ok=True)
+    actual_docx = write_docx(proc_txt, nets, args.out_docx, args.board_hint)
+    print(f"✅ Wrote Word doc: {actual_docx}")
+
 
     # (Optional) also write Markdown for diffing/review
     if args.out_md:
-        os.makedirs(os.path.dirname(os.path.abspath(args.out_md)), exist_ok=True)
+        out_md_dir = os.path.dirname(os.path.abspath(args.out_md))
+        if out_md_dir:
+            os.makedirs(out_md_dir, exist_ok=True)
         with open(args.out_md, "w", encoding="utf-8") as f:
             f.write(proc_txt)
 
