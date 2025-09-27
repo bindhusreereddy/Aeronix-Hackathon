@@ -2,16 +2,46 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Generate Bring-Up Plan",
+      "name": "Generate Bring-Up (Car PCB IPC → .docx)",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/lora-bringup-gen/generator/generate_plan.py",
+      "program": "${workspaceFolder}/lora-bringup-gen/generator/ipc_to_plan_llm.py",
+      "cwd": "${workspaceFolder}/lora-bringup-gen",
       "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "OPENAI_API_KEY": "sk-proj-a9KTNhPvATXy9zTPjVb8T3BlbkFJL6zJexDrMhosiuXcaz5J"
+      },
       "args": [
-        "--requirements", "${workspaceFolder}/lora-bringup-gen/inputs/requirements.yaml",
-        "--out-md", "${workspaceFolder}/lora-bringup-gen/outputs/LoRa_Car_Radio_BringUp.md",
-        "--out-csv", "${workspaceFolder}/lora-bringup-gen/outputs/BringUp_Datasheet.csv"
+        "--ipc", "${workspaceFolder}/lora-bringup-gen/inputs/Assembly Testpoint Report for Car-PCB1.ipc",
+        "--out-docx", "${workspaceFolder}/lora-bringup-gen/outputs/BringUp_From_IPC.docx",
+        "--board-hint", "Car Radio"
       ]
+    },
+    {
+      "name": "Generate Bring-Up (Pick IPC → .docx)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/lora-bringup-gen/generator/ipc_to_plan_llm.py",
+      "cwd": "${workspaceFolder}/lora-bringup-gen",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "OPENAI_API_KEY": "${env:OPENAI_API_KEY}"
+      },
+      "args": [
+        "--ipc", "${input:ipcPath}",
+        "--out-docx", "${workspaceFolder}/lora-bringup-gen/outputs/BringUp_From_IPC.docx",
+        "--board-hint", "Arduino Uno"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "ipcPath",
+      "type": "promptString",
+      "description": "Enter path to the IPC netlist (.ipc)",
+      "default": "${workspaceFolder}/lora-bringup-gen/inputs/arduino_netlist.ipc"
     }
   ]
 }

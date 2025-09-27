@@ -20,6 +20,140 @@ def merge_points(rails, derived):
                 pts.append(p)
         r["points"] = pts
 
+def llm_goodwill_from_blocks(
+    blocks: Union[str, List[str], Tuple[str, ...]],
+    *,
+    k: int = 8,
+    min_par_len: int = 40,
+    filter_to_goodwill: bool = True,
+    verbose: bool = False,
+    print_retrieval: bool = False,   # <— NEW
+) -> Optional[str]:
+    """
+    Extracts goodwill amount from text blocks using a RAG (LLM) pipeline.
+
+    This function takes text, finds relevant paragraphs concerning goodwill using
+    vector embeddings, and then uses a large language model (LLM) to extract
+    the specific monetary amount.
+    """
+    # 1. Normalize input into a list of strings.
+    if isinstance(blocks, str):
+        text_blocks: List[str] = [blocks]
+    else:
+        text_blocks = [b for b in blocks if isinstance(b, str) and b.strip()]
+
+    if not text_blocks:
+        if verbose: print("[goodwill LLM] No text blocks provided.", file=sys.stderr)
+        return None
+
+    # 2. Chunk text into paragraphs based on blank lines.
+    paras: List[str] = []
+    for b in text_blocks:
+        for p in re.split(r"\n\s*\n", b):
+            p = p.strip()
+            if len(p) >= min_par_len:
+                paras.append(p)
+
+    # 3. (Optional) Pre-filter paragraphs to only those containing "goodwill".
+    if filter_to_goodwill:
+        paras = [p for p in paras if re.search(r"\bgoodwill\b", p, flags=re.IGNORECASE)]
+
+    if not paras:
+        if verbose: print("[goodwill LLM] No paragraphs after filtering.", file=sys.stderr)
+        return None
+
+    try:
+        # 4. Set up the RAG pipeline.
+        # 4a. Initialize embeddings model (OpenAI or local HuggingFace).
+        if os.getenv("OPENAI_API_KEY"):
+            from langchain_openai import OpenAIEmbeddings
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        else:
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+            embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+        # 4b. Create LangChain documents and build a FAISS vector store for fast retrieval.
+        from langchain.schema import Document
+        docs = [Document(page_content=p) for p in paras]
+        if not docs:
+            if verbose: print("[goodwill LLM] No docs to index.", file=sys.stderr)
+            return None
+
+        from langchain_community.vectorstores import FAISS
+        vs = FAISS.from_documents(docs, embeddings)
+        retriever = vs.as_retriever(search_kwargs={"k": max(3, k)})
+
+        # 4c. Define a query to find relevant paragraphs about goodwill allocation.
+        query = (
+            "goodwill amount recorded recognized purchase price allocation "
+            "'recorded as goodwill' 'Goodwill of approximately' amount value currency"
+        )
+
+        # 4d. (Optional) Print the most similar paragraphs for debugging.
+        if print_retrieval:
+            try:
+                hits = vs.similarity_search_with_score(query, k=max(3, k))
+                print(f"\n[retriever] top {len(hits)} paragraphs (lower score is closer):")
+                for rank, (doc, score) in enumerate(hits, 1):
+                    print(f"\n--- #{rank} | score={score:.4f} ---")
+                    print(doc.page_content)
+                    # Quick one-line preview if helpful
+                    print("\n[preview]", textwrap.shorten(doc.page_content.replace("\n", " "), width=200))
+                print("\n[end retriever dump]\n")
+            except Exception as e:
+                print(f"[retriever] could not print hits: {e}", file=sys.stderr)
+
+        # 5. If no OpenAI key, stop here. The retrieval part is still useful for debugging.
+        if not os.getenv("OPENAI_API_KEY"):
+            if verbose: print("[goodwill LLM] OPENAI_API_KEY not set; skipping LLM step.", file=sys.stderr)
+            return None
+
+        # LLM + prompt (IMPORTANT: includes {context})
+        from langchain_openai import ChatOpenAI
+        from langchain.prompts import ChatPromptTemplate
+        from langchain.chains import RetrievalQA
+
+        # 6a. Initialize the LLM and the prompt template.
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        prompt = ChatPromptTemplate.from_template(
+            "You are a precise financial extraction assistant.\n"
+            "Use ONLY the context to extract the monetary amount(s) explicitly recorded as goodwill.\n"
+            "Return ONLY the amount(s) with units/currency (e.g., \"$129 million\").\n"
+            "If no goodwill amount is present, answer exactly: No goodwill amount found.\n\n"
+            "Context:\n{context}\n\n"
+            "Question: {question}"
+        )
+
+        # 6b. Create the RetrievalQA chain that combines the retriever and LLM.
+        qa = RetrievalQA.from_chain_type(
+            llm=llm,
+            retriever=retriever,
+            chain_type="stuff",
+            chain_type_kwargs={"prompt": prompt},
+            return_source_documents=False,
+        )
+
+        # 6c. Invoke the chain and get the answer.
+        result = qa.invoke({"query": query})
+        answer = (result.get("result") or result.get("output_text") or "").strip()
+
+        if verbose:
+            print(f"[goodwill LLM] Raw answer: {answer!r}", file=sys.stderr)
+
+        # 7. Process the LLM's raw output.
+        if not answer or answer.lower().startswith("no goodwill"):
+            return None
+
+        # Extract structured amounts from the free-text answer and return them.
+        amounts = _extract_amounts(answer)
+        return "; ".join(amounts) if amounts else (answer or None)
+
+    except Exception as e:
+        if verbose:
+            import traceback
+            print(f"[goodwill LLM] Exception: {e}", file=sys.stderr)
+            traceback.print_exc()
+        return None
 MD_TEMPLATE = """# {product} Bring-Up Plan (Auto-Generated)
 Generated: {timestamp}
 
