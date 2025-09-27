@@ -13,8 +13,8 @@ from pathlib import Path
 
 import streamlit as st
 
-st.set_page_config(page_title="Plan Generator", layout="centered")
-st.title("Plan Generator")
+st.set_page_config(page_title="Test Plan Generator", layout="centered")
+st.title("Test Plan Generator")
 
 # 1) OpenAI API key (masked)
 api_key = st.text_input("OpenAI API Key", type="password")
