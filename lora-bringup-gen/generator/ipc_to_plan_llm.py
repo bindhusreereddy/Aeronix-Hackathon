@@ -13,6 +13,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 import time
 from pathlib import Path
+from collections import defaultdict
 
 def safe_docx_save(doc, desired_path: str, attempts: int = 3) -> str:
     """
@@ -100,6 +101,7 @@ def _add_rails_table(doc: Document, rows: List[dict]):
         cells[5].text = ""  # left blank for operator to fill
     # A bit of spacing after
     doc.add_paragraph()
+
 def write_docx(procedure_text: str, nets: Dict[str, List[str]], out_docx: str, board_hint: str | None, meta: dict | None = None):
     doc = Document()
 
@@ -146,8 +148,6 @@ def write_docx(procedure_text: str, nets: Dict[str, List[str]], out_docx: str, b
     # Save (robust)
     actual_path = safe_docx_save(doc, out_docx)
     return actual_path  # optionally return the path we actually wrote
-
-
 # Map rails to expected values/tolerance for the table
 _POWER_SPEC = {
     "PWR_5V":   (5.0, 0.10),
@@ -162,6 +162,7 @@ def load_meta(path: str) -> dict:
         if path.lower().endswith((".yaml", ".yml")) and yaml:
             return yaml.safe_load(f) or {}
         return json.load(f)
+
 def power_rows_from_nets(nets: Dict[str, List[str]]):
     rows = []  # list of dicts: {net, expected, tol, probe_points}
     for label, (exp, tol) in _POWER_SPEC.items():
@@ -207,20 +208,29 @@ def validate_and_read_ipc(ipc_path: str) -> str:
     # Must look like IPC-D-356 style or a vendor testpoint report with NET lines.
     # We require at least TWO of these signals to reduce false positives.
     patterns = [
-        r"(?mi)^\s*Net\s+[^\s:]+:\s*.+$",                # IPC-D-356 signature
-        r"(?mi)^\s*N\s+[A-Za-z0-9_\-+./]+",        # "NET <name>: U6-14, P2-2, TP7"
-        r"(?mi)^\s*\S+\s+[A-Z]+[0-9A-Z]+\s+-?[A-Za-z0-9]+\s+[PU][A-Z]\d{2,3}X\s+\d+Y\s+\d+X",   # "N <name>"
-        r"(?i)\bIPC[- ]?D[- ]?356",                   # mentions test points
-        r"(?i)\bTEST\s*POINT\b",                          # TP5, TP7, ...
-        r"(?i)\bTP\d+\b",
-        r"(?i)\b[A-Z]+[A-Z0-9]*-[A-Za-z0-9]+\b"   # U6-14, P2-2, J3-1
-    ]
+    r"(?mi)^\s*Net\s+[^\s:]+:\s*.+$",                 # "NET <name>: ..."
+    r"(?mi)^\s*N\s+[A-Za-z0-9_\-+./]+",               # "N <name>" blocks
+    # IPC-D-356A table-style rows like:
+    # 317AD5/SCL          ZU4   -28   D0335PA00X+069715Y-046890...
+    # 327GND              Y2    -2    A01X+061215Y-042040...
+    r"""(?mx)
+    ^(?![CP]\s)                   # skip header/comment rows starting with 'C ' or 'P '
+    \s*\d{3}[A-Za-z0-9+_.#/\\-]+  # 3-digit net index (e.g., 317/327) + net token
+    \s+[A-Za-z][A-Za-z0-9_]*(?:-X)? # refdes like ZU4, Y2, TP_PB7-X
+    (?:\s+-\s*[A-Za-z0-9]+)?      # optional ' - <pin>' column
+    \b
+    """,
+    r"(?i)\bIPC[- ]?D[- ]?356",                       # mentions standard
+    r"(?i)\bTEST\s*POINT\b",
+    r"(?i)\bTP\d+\b",
+    r"(?i)\b[A-Z]+[A-Z0-9]*-[A-Za-z0-9]+\b"           # U6-14, P2-2, J3-1
+]
+
     hits = sum(1 for p in patterns if re.search(p, text, re.IGNORECASE))
     if hits < 2:
         raise ValueError("INVALID DOCUMENT: Not a recognizable IPC netlist.")
 
     return text
-
 
 # -------------------------------
 # 1) Minimal IPC parser (nets -> connections)
@@ -244,58 +254,44 @@ _IPC_TABLINE = re.compile(
     """
 )
 
-def parse_ipc_text(text: str) -> Dict[str, List[str]]:
-    nets: Dict[str, Set[str]] = {}
+ROW = re.compile(r"""
+    ^(?![CP]\s)                                  # skip lines starting with 'C ' or 'P '
+    \s*([0-9A-Za-z+_.#/\\\-$]+)                  # (1) NET name (allow + _ . - / \ # $)
+    \s+([A-Za-z][A-Za-z0-9_]*?(?:_[A-Za-z0-9]+)?(?:-X)?)   # (2) REF (ZU4, L0, Y2, TP_PB7-X)
+    (?:\s+-\s*([A-Za-z0-9]+))?                   # (3) optional PIN after a standalone '-' column (e.g., 25, A)
+    \b
+""", re.VERBOSE | re.MULTILINE)
 
-    # A) "NET <name>: ..." lines
-    for m in re.finditer(r"(?m)^\s*NET\s+([^\s:]+)\s*:\s*(.+)$", text):
-        name = m.group(1).strip()
-        rhs  = m.group(2)
-        cons: Set[str] = set()
-        for pad in _PAD.findall(rhs):
-            cons.add(f"{pad[0]}-{pad[1]}")
-        for tp in _TP.findall(rhs):
-            cons.add(tp.upper())
-        if cons:
-            nets.setdefault(name, set()).update(cons)
+def parse_ipc_d356(text: str) -> Dict[str, List[str]]:
+    """
+    Parse IPC-D-356A table-style rows including 317/327 netlines.
+    Returns: { net: sorted([ref, ref-pin, TP alias ...]) }
+    """
+    nets = defaultdict(set)
 
-    # B) "N <name>" blocks
-    current = None
-    for line in text.splitlines():
-        ln = line.strip()
-        nm = re.match(r"^N\s+([A-Za-z0-9_\-\+\./]+)", ln)
-        if nm:
-            current = nm.group(1)
-            nets.setdefault(current, set())
-            continue
-        if current:
-            for pad in _PAD.findall(ln):
-                nets[current].add(f"{pad[0]}-{pad[1]}")
-            for tp in _TP.findall(ln):
-                nets[current].add(tp.upper())
-
-    # C) IPC-D-356A table rows (the file you posted)
-    for m in _IPC_TABLINE.finditer(text):
+    for m in ROW.finditer(text):
         net = m.group(1).strip()
-        ref = m.group(2).upper()
+        ref = m.group(2).strip()
         pin = (m.group(3) or "").strip()
 
-        # Skip pure mechanical holes; keep PTH* if you want them—here we drop VIA only
-        if ref == "VIA":
-            continue
+        RU = ref.upper()
+        if RU == "VIA":
+            continue  # vias are not probe points
 
-        # Compose ref-pin like U7-2 if we have a pin; else keep the ref
-        refpin = f"{ref}-{pin}" if pin else ref
+        # If there's an explicit pin column, emit REF-PIN (e.g., ZU4-28, L0-A)
+        if pin:
+            refpin = f"{RU}-{pin}"
+            nets[net].add(refpin)
+        # Always keep the ref itself too
+        nets[net].add(RU)
 
-        # Capture TP references both ways (as TPx and TPx-<pin>) for easier probing
-        cons = nets.setdefault(net, set())
-        cons.add(refpin)
-        if ref.startswith("TP"):
-            cons.add(ref)  # e.g., TP1
+        # Convenience aliases for TP_* refs ending with -X (e.g., TP_PB7-X -> TP_PB7)
+        if RU.startswith("TP") and RU.endswith("-X"):
+            alias = RU.rsplit("-", 1)[0]
+            nets[net].add(alias)
 
-    # finalize
-    nets = {k: sorted(v) for k, v in nets.items() if v}
-    return nets
+    # Return sorted, deduped lists
+    return {k: sorted(v) for k, v in nets.items()}
 
 
 
@@ -527,17 +523,21 @@ METADATA (optional):
 ---------
 """
 
-def call_openai_procedure(context: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
+def call_openai_procedure(context: str, nets: Dict[str, List[str]], meta: dict) -> str:
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set. Cannot generate document via OpenAI.")
+
     try:
         from openai import OpenAI
     except Exception as e:
         raise RuntimeError("OpenAI client not installed. pip install openai") from e
 
     client = OpenAI(api_key=api_key)
-    prompt = PROMPT_TMPL.format(context=context)
+
+    # Build the final prompt (fills {J3_1}, {PLUS5}, etc.) cleanly.
+    prompt = build_prompt(context, nets, meta)
+
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,
@@ -570,6 +570,7 @@ def call_openai_markdown(context: str, nets: Dict[str, List[str]], meta: dict) -
     if not md.strip().lower().startswith("3.2"):
         md = f"3.2. Test Equipment\n\n" + md  # ensure numbering starts per spec
     return md
+
 def build_prompt(context: str, nets: Dict[str, List[str]], meta: dict) -> str:
     a = pick_anchors(nets)
     return PROMPT_TMPL.format(
@@ -586,6 +587,7 @@ def build_prompt(context: str, nets: Dict[str, List[str]], meta: dict) -> str:
         PLUS3=a["human"]["p3v3"],
         PLUS3RF=a["human"]["p3v3rf"],
     )
+
 def pick_anchors(nets: Dict[str, List[str]]) -> dict:
     """Pick canonical probe points matching your doc style."""
     def by_net(name):
@@ -648,7 +650,7 @@ def main():
         sys.exit(2)
 
     # 2) PARSE
-    nets = parse_ipc_text(text)
+    nets = parse_ipc_d356(text)
     if not nets:
         sys.stderr.write("INVALID DOCUMENT: No nets/testpoints parsed from the file.\n")
         sys.exit(2)
@@ -663,60 +665,11 @@ def main():
 
     # 4) Get step-by-step procedure text from LLM
     try:
-        # Prefer the new signature (ctx, nets, meta)
         try:
-            proc_txt = call_openai_procedure(ctx, nets, meta)  # new signature
-        except TypeError:
-            # === Legacy fallback path ===
-            # Patch PROMPT_TMPL so it contains only {context} before legacy function formats it.
-            # Build anchors safely from parsed nets.
-            def _take(refs, prefix, pins=None):
-                lst = [r for r in refs if r.startswith(prefix + "-")]
-                if pins:
-                    lst = [f"{prefix}-{p}" for p in pins if f"{prefix}-{p}" in lst]
-                return lst
-
-            # NEW: escape braces helper for JSON insertion
-            def _esc_braces(s: str) -> str:
-                return s.replace("{", "{{").replace("}", "}}")
-
-            gnd_refs    = nets.get("327GND", []) or nets.get("GND", [])
-            pwrjack_refs= nets.get("327PWR_JACK", []) or nets.get("PWR_JACK", [])
-            plus5_refs  = nets.get("327+5V", []) or nets.get("+5V", [])
-            plus33_refs = nets.get("327+3V3", []) or nets.get("+3V3", [])
-            plus33rf_refs = nets.get("327+3V3_RF", []) or nets.get("+3V3_RF", [])
-
-            J3_1 = (_take(pwrjack_refs, "J3", ["1"]) or _take(pwrjack_refs, "J3") or ["J3-1"])[0]
-            J3_2 = (_take(gnd_refs, "J3", ["2"]) or _take(gnd_refs, "J3") or ["J3-2"])[0]
-            U6_14_16_list = _take(plus5_refs, "U6", ["14","15","16"]) or [r for r in plus5_refs if r.startswith("U6-")] or ["U6-14"]
-            U6_14_16 = ", ".join(U6_14_16_list)
-            P2_2 = (_take(plus33_refs, "P2", ["2"]) or _take(plus33_refs, "P2") or ["P2-2"])[0]
-            U12_1 = (_take(plus33rf_refs, "U12", ["1"]) or _take(plus33rf_refs, "U12") or ["U12-1"])[0]
-
-            GND_PAD = "ground pad (pin 2) of the input barrel jack (J3) (GND)" if J3_2.startswith("J3-2") else "a known GND pad"
-            PWR_JACK = f"{J3_1} (PWR_JACK)"
-            PLUS5 = f"{U6_14_16} (+5V)"
-            PLUS3 = f"{P2_2} (+3V3)"
-            PLUS3RF = f"{U12_1} (+3V3_RF)"
-
-            global PROMPT_TMPL
-            prepared = (PROMPT_TMPL
-                        .replace("{J3_1}", J3_1)
-                        .replace("{J3_2}", J3_2)
-                        .replace("{U6_14_16}", U6_14_16)
-                        .replace("{P2_2}", P2_2)
-                        .replace("{U12_1}", U12_1)
-                        .replace("{GND_PAD}", GND_PAD)
-                        .replace("{PWR_JACK}", PWR_JACK)
-                        .replace("{PLUS5}", PLUS5)
-                        .replace("{PLUS3}", PLUS3)
-                        .replace("{PLUS3RF}", PLUS3RF)
-                        # IMPORTANT: escape braces in JSON so .format(context=...) won't choke
-                        .replace("{metadata}", _esc_braces(json.dumps(meta or {}, indent=2)))
-                       )
-            PROMPT_TMPL = prepared
-
-            proc_txt = call_openai_procedure(ctx)  # legacy signature
+            proc_txt = call_openai_procedure(ctx, nets, meta)
+        except Exception as e:
+            sys.stderr.write(f"LLM ERROR: {e}\n")
+            sys.exit(3)
     except Exception as e:
         sys.stderr.write(f"LLM ERROR: {e}\n")
         sys.exit(3)
@@ -742,8 +695,6 @@ def main():
     print(f"✅ Wrote Word doc: {args.out_docx}")
     if args.out_md:
         print(f"✅ Also wrote Markdown: {args.out_md}")
-
- 
 
 if __name__ == "__main__":
     main()
