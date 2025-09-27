@@ -47,7 +47,7 @@ if run:
     artifacts.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_docx = artifacts / f"plan_{ts}.docx"
+    out_docx = artifacts / f"TestPlan_{ts}.docx"
 
     # Save the uploaded file to a temp path and pass that path as --ipc
     tmp_dir = Path(tempfile.mkdtemp(prefix="ipc_input_"))
